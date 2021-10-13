@@ -26,6 +26,8 @@ As your application state changes (whether it's via your APIs, DBs, git, S3 or 3
 
 Check out our main site at <a href="https://opal.ac">OPAL.ac</a> <br/> and this <a href="https://youtu.be/tG8jrdcc7Zo">Microsoft video briefly explaining OPAL and how it works with OPA</a>.
 
+Give us a star ⭐️ - If you are using OPAL or think it is an interesting project, we would love a star ❤️
+
 ## Table of contents
  - [Getting Started](#getting-started)
  - [Intro to OPAL](#intro)
@@ -163,6 +165,7 @@ See a [more detailed diagram](https://i.ibb.co/kGc9nDd/main.png)
 - [How to get started with OPAL (Container Images)](docs/HOWTO/get_started_with_opal_using_docker.md)
 - [How to trigger Data Updates via OPAL](docs/HOWTO/trigger_data_updates.md)
 - [How to extend OPAL to fetch data from your sources with FetchProviders](docs/HOWTO/write_your_own_fetch_provider.md)
+- [How to configure OPAL (basic concepts)](docs/HOWTO/configure_opal.md)
 
 
 

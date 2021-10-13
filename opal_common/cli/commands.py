@@ -53,7 +53,7 @@ def obtain_token(
     async def fetch():
         async with ClientSession(headers={"Authorization": f"bearer {master_token}"}) as session:
             details = AccessTokenRequest(type=type, ttl=ttl, claims=claims).json()
-            res = await session.post(server_url, data=details)
+            res = await session.post(server_url, data=details, headers={'content-type': 'application/json'})
             data = await res.json()
             if just_the_token:
                 return data["token"]
@@ -78,13 +78,13 @@ def publish_data_update(
                                     callback=lambda x: json.loads(x)),
 
         src_url: str = typer.Option(None,
-                                    help="[SINGLE-ENTRY-UPDATE] url of the data-source this update relates to, which the clients should approach"),                     
+                                    help="[SINGLE-ENTRY-UPDATE] url of the data-source this update relates to, which the clients should approach"),
         topics: List[str] = typer.Option(None, "--topic","-t",
-                                    help="[SINGLE-ENTRY-UPDATE] [List] topic (can several) for the published update (to be matched to client subscriptions)"),                     
+                                    help="[SINGLE-ENTRY-UPDATE] [List] topic (can several) for the published update (to be matched to client subscriptions)"),
         src_config: str = typer.Option("{}",
-                                    help="[SINGLE-ENTRY-UPDATE] Fetching Config as JSON",  callback=lambda x: json.loads(x)),                     
+                                    help="[SINGLE-ENTRY-UPDATE] Fetching Config as JSON",  callback=lambda x: json.loads(x)),
         dst_path: str = typer.Option("",
-                                    help="[SINGLE-ENTRY-UPDATE] Path the client should set this value in its data-store"),                     
+                                    help="[SINGLE-ENTRY-UPDATE] Path the client should set this value in its data-store"),
         save_method: str = typer.Option("PUT",
                                     help="[SINGLE-ENTRY-UPDATE] How the data should be saved into the give dst-path")):
     """
@@ -114,9 +114,9 @@ def publish_data_update(
     update = DataUpdate(entries=entries, reason=reason)
 
     async def publish_update():
-        headers = {}
+        headers = {'content-type': 'application/json'}
         if token is not None:
-            headers={"Authorization": f"bearer {token}"}
+            headers.update({"Authorization": f"bearer {token}"})
         async with ClientSession(headers=headers) as session:
             body = update.json()
             res = await session.post(server_url, data=body)

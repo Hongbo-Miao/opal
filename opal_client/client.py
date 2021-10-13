@@ -4,22 +4,30 @@ import signal
 import asyncio
 import aiohttp
 import functools
-from typing import List
+from typing import List, Optional
 
 from fastapi import FastAPI
 import websockets
 
 from opal_common.logger import logger, configure_logs
 from opal_common.middleware import configure_middleware
+from opal_common.config import opal_common_config
+from opal_common.security.sslcontext import get_custom_ssl_context
+from opal_common.authentication.verifier import JWTVerifier
+from opal_common.authentication.deps import JWTAuthenticator
+from opal_client.policy_store.api import init_policy_store_router
 from opal_client.config import PolicyStoreTypes, opal_client_config
 from opal_client.data.api import init_data_router
 from opal_client.data.updater import DataUpdater
+from opal_client.data.fetcher import DataFetcher
 from opal_client.policy_store.base_policy_store_client import BasePolicyStoreClient
 from opal_client.policy_store.policy_store_client_factory import PolicyStoreClientFactory
 from opal_client.opa.runner import OpaRunner
 from opal_client.opa.options import OpaServerOptions
 from opal_client.policy.api import init_policy_router
 from opal_client.policy.updater import PolicyUpdater
+from opal_client.callbacks.register import CallbacksRegister
+from opal_client.callbacks.api import init_callbacks_api
 
 
 class OpalClient:
@@ -32,6 +40,7 @@ class OpalClient:
         policy_updater:PolicyUpdater=None,
         inline_opa_enabled:bool=None,
         inline_opa_options:OpaServerOptions=None,
+        verifier: Optional[JWTVerifier] = None,
     ) -> None:
         """
         Args:
@@ -51,28 +60,64 @@ class OpalClient:
         # Init policy store client
         self.policy_store_type:PolicyStoreTypes = policy_store_type
         self.policy_store:BasePolicyStoreClient = policy_store or PolicyStoreClientFactory.create(policy_store_type)
-        # Init policy updater
-        self.policy_updater = policy_updater if policy_updater is not None else PolicyUpdater(policy_store=self.policy_store)
-        # Data updating service
-        if data_updater is not None:
-            self.data_updater = data_updater
+        # data fetcher
+        self.data_fetcher = DataFetcher()
+        # callbacks register
+        if hasattr(opal_client_config.DEFAULT_UPDATE_CALLBACKS, 'callbacks'):
+            default_callbacks = opal_client_config.DEFAULT_UPDATE_CALLBACKS.callbacks
         else:
-            data_topics = data_topics if data_topics is not None else opal_client_config.DATA_TOPICS
-            self.data_updater = DataUpdater(policy_store=self.policy_store, data_topics=data_topics)
+            default_callbacks = []
+
+        self._callbacks_register = CallbacksRegister(default_callbacks)
+
+        # Init policy updater
+        if policy_updater is not None:
+            self.policy_updater = policy_updater
+        else:
+            self.policy_updater = PolicyUpdater(policy_store=self.policy_store, data_fetcher=self.data_fetcher, callbacks_register=self._callbacks_register)
+        # Data updating service
+        if opal_client_config.DATA_UPDATER_ENABLED:
+            if data_updater is not None:
+                self.data_updater = data_updater
+            else:
+                data_topics = data_topics if data_topics is not None else opal_client_config.DATA_TOPICS
+                self.data_updater = DataUpdater(policy_store=self.policy_store, data_topics=data_topics, data_fetcher=self.data_fetcher, callbacks_register=self._callbacks_register)
+        else:
+            self.data_updater = None
 
         # Internal services
         # Policy store
         if self.policy_store_type == PolicyStoreTypes.OPA and inline_opa_enabled:
-            self.opa_runner = OpaRunner.setup_opa_runner(
-                options=inline_opa_options,
-                rehydration_callbacks=[
-                    # refetches policy code (e.g: rego) and static data from server
-                    functools.partial(self.policy_updater.update_policy, force_full_update=True),
-                    functools.partial(self.data_updater.get_base_policy_data, data_fetch_reason="policy store rehydration"),
-                ]
-            )
+            rehydration_callbacks = [
+                # refetches policy code (e.g: rego) and static data from server
+                functools.partial(self.policy_updater.update_policy, force_full_update=True),
+            ]
+
+            if self.data_updater:
+                rehydration_callbacks.append(
+                    functools.partial(self.data_updater.get_base_policy_data, data_fetch_reason="policy store rehydration")
+                )
+
+            self.opa_runner = OpaRunner.setup_opa_runner(options=inline_opa_options, rehydration_callbacks=rehydration_callbacks)
         else:
             self.opa_runner = False
+
+
+        custom_ssl_context = get_custom_ssl_context()
+        if opal_common_config.CLIENT_SELF_SIGNED_CERTIFICATES_ALLOWED and custom_ssl_context is not None:
+            logger.warning("OPAL client is configured to trust self-signed certificates")
+
+        if verifier is not None:
+            self.verifier = verifier
+        else:
+            self.verifier = JWTVerifier(
+                public_key=opal_common_config.AUTH_PUBLIC_KEY,
+                algorithm=opal_common_config.AUTH_JWT_ALGORITHM,
+                audience=opal_common_config.AUTH_JWT_AUDIENCE,
+                issuer=opal_common_config.AUTH_JWT_ISSUER,
+            )
+        if not self.verifier.enabled:
+            logger.info("API authentication disabled (public encryption key was not provided)")
 
         # init fastapi app
         self.app: FastAPI = self._init_fast_api_app()
@@ -98,13 +143,20 @@ class OpalClient:
         """
         mounts the api routes on the app object
         """
+
+        authenticator = JWTAuthenticator(self.verifier)
+
         # Init api routers with required dependencies
         policy_router = init_policy_router(policy_updater=self.policy_updater)
         data_router = init_data_router(data_updater=self.data_updater)
+        policy_store_router = init_policy_store_router(authenticator)
+        callbacks_router = init_callbacks_api(authenticator, self._callbacks_register)
 
         # mount the api routes on the app object
         app.include_router(policy_router, tags=["Policy Updater"])
         app.include_router(data_router, tags=["Data Updater"])
+        app.include_router(policy_store_router, tags=["Policy Store"])
+        app.include_router(callbacks_router, tags=["Callbacks"])
 
         # top level routes (i.e: healthchecks)
         @app.get("/healthcheck", include_in_schema=False)

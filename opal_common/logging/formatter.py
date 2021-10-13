@@ -2,8 +2,8 @@ class Formatter:
 
     MAX_FIELD_LEN = 25
 
-    def __init__(self):
-        self.fmt = "<green>{time}</green> |<blue>{name: <40}</blue>|<level>{level:^6} | {message}</level>\n{exception}"
+    def __init__(self, format_string: str):
+        self.fmt = format_string
 
     def limit_len(self, record, field, length=MAX_FIELD_LEN):
         #Shorten field content

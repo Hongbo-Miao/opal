@@ -1,21 +1,14 @@
-from opal_common.fetcher.providers.http_fetch_provider import HttpFetcherConfig
-import os
 from enum import Enum
-from sys import prefix
 
-import opal_client
-from opal_client.opa.options import OpaServerOptions
+from opal_common.fetcher.providers.http_fetch_provider import HttpFetcherConfig
 from opal_common.confi import Confi, confi
 from opal_common.config import opal_common_config
 from opal_common.schemas.data import UpdateCallback
+from opal_client.opa.options import OpaServerOptions
+from opal_client.policy_store.schemas import PolicyStoreTypes
 
 
 # Opal Client general configuration -------------------------------------------
-class PolicyStoreTypes(Enum):
-    OPA = "OPA"
-    MOCK = "MOCK"
-
-
 class OpaLogFormat(str, Enum):
     NONE = "none"  # no opa logs are piped
     MINIMAL = "minimal"  # only the event name is logged
@@ -26,7 +19,8 @@ class OpaLogFormat(str, Enum):
 class OpalClientConfig(Confi):
     # opa client (policy store) configuration
     POLICY_STORE_TYPE = confi.enum("POLICY_STORE_TYPE", PolicyStoreTypes, PolicyStoreTypes.OPA)
-    POLICY_STORE_URL = confi.str("POLICY_STORE_URL", f"http://localhost:8181/v1")
+    POLICY_STORE_URL = confi.str("POLICY_STORE_URL", f"http://localhost:8181")
+    POLICY_STORE_AUTH_TOKEN = confi.str("POLICY_STORE_AUTH_TOKEN", None, description="the authentication (bearer) token OPAL client will use to authenticate against the policy store (i.e: OPA agent)")
     # create an instance of a policy store upon load
 
     def load_policy_store():
@@ -85,6 +79,11 @@ class OpalClientConfig(Confi):
                                           description="directories in policy repo we should subscribe to")
 
     # Data updater configuration --------------------------------------------------
+    DATA_UPDATER_ENABLED = confi.bool(
+        "DATA_UPDATER_ENABLED",
+        True,
+        description="If set to False, opal client will not listen to dynamic data updates. Dynamic data fetching will be completely disabled.")
+
     DATA_TOPICS = confi.list("DATA_TOPICS", ["policy_data"],
                              description="Data topics to subscribe to")
 
@@ -94,10 +93,10 @@ class OpalClientConfig(Confi):
     DEFAULT_DATA_URL = confi.str("DEFAULT_DATA_URL", "http://localhost:8000/policy-config",
                                  description="Default URL to fetch data from")
 
-    SHOULD_REPORT_ON_DATA_UPDATES = confi.bool("SEND_REPORTS_ON_DATA_UPDATES", False,
+    SHOULD_REPORT_ON_DATA_UPDATES = confi.bool("SHOULD_REPORT_ON_DATA_UPDATES", False,
                                               description="Should the client report on updates to callbacks defined in DEFAULT_UPDATE_CALLBACKS or within the given updates")
     DEFAULT_UPDATE_CALLBACK_CONFIG = confi.model(
-        "DEFAULT_UPDATE_CALLBACK_CONFIG", HttpFetcherConfig, {"method": "post", "headers": {'content-type': 'application/json'}})
+        "DEFAULT_UPDATE_CALLBACK_CONFIG", HttpFetcherConfig, {"method": "post", "headers": {"content-type": "application/json"}, "process_data": False})
 
     DEFAULT_UPDATE_CALLBACKS = confi.model("DEFAULT_UPDATE_CALLBACKS", UpdateCallback, confi.delay(lambda SERVER_URL="": {
         "callbacks": [f"{SERVER_URL}/data/callback_report"]

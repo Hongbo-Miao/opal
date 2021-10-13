@@ -1,9 +1,8 @@
-from opal_server.security.api import init_security_router
-from opal_server.security.jwks import JwksStaticEndpoint
 import os
 import asyncio
 from functools import partial
-from typing import Optional
+from typing import Optional, List
+from pathlib import Path
 
 from fastapi import Depends, FastAPI
 
@@ -13,10 +12,13 @@ from opal_common.schemas.data import ServerDataSourceConfig
 from opal_common.synchronization.named_lock import NamedLock
 from opal_common.middleware import configure_middleware
 from opal_common.authentication.signer import JWTSigner
+from opal_common.authentication.deps import JWTAuthenticator, StaticBearerAuthenticator
+from opal_common.config import opal_common_config
 from opal_server.config import opal_server_config
+from opal_server.security.api import init_security_router
+from opal_server.security.jwks import JwksStaticEndpoint
 from opal_server.data.api import init_data_updates_router
 from opal_server.data.data_update_publisher import DataUpdatePublisher
-from opal_server.deps.authentication import JWTVerifier, StaticBearerTokenVerifier
 from opal_server.policy.bundles.api import router as bundles_router
 from opal_server.policy.github_webhook.api import init_git_webhook_router
 from opal_server.policy.watcher import (setup_watcher_task,
@@ -90,11 +92,13 @@ class OpalServer:
         else:
             self.signer = JWTSigner(
                 private_key=opal_server_config.AUTH_PRIVATE_KEY,
-                public_key=opal_server_config.AUTH_PUBLIC_KEY,
-                algorithm=opal_server_config.AUTH_JWT_ALGORITHM,
-                audience=opal_server_config.AUTH_JWT_AUDIENCE,
-                issuer=opal_server_config.AUTH_JWT_ISSUER,
+                public_key=opal_common_config.AUTH_PUBLIC_KEY,
+                algorithm=opal_common_config.AUTH_JWT_ALGORITHM,
+                audience=opal_common_config.AUTH_JWT_AUDIENCE,
+                issuer=opal_common_config.AUTH_JWT_ISSUER,
             )
+        if not self.signer.enabled:
+            logger.info("OPAL was not provided with JWT encryption keys, cannot verify api requests!")
 
         if enable_jwks_endpoint:
             self.jwks_endpoint = JwksStaticEndpoint(
@@ -112,6 +116,7 @@ class OpalServer:
             self.publisher = ServerSideTopicPublisher(self.pubsub.endpoint)
 
             if init_git_watcher:
+                self._fix_policy_repo_clone_path()
                 if policy_repo_url is not None:
                     self.watcher = setup_watcher_task(self.publisher)
                 else:
@@ -142,6 +147,8 @@ class OpalServer:
         """
         mounts the api routes on the app object
         """
+        authenticator = JWTAuthenticator(self.signer)
+
         data_update_publisher: Optional[DataUpdatePublisher] = None
         if self.publisher is not None:
             data_update_publisher = DataUpdatePublisher(self.publisher)
@@ -149,16 +156,15 @@ class OpalServer:
         # Init api routers with required dependencies
         data_updates_router = init_data_updates_router(
             data_update_publisher,
-            self.data_sources_config
+            self.data_sources_config,
+            authenticator
         )
         webhook_router = init_git_webhook_router(self.pubsub.endpoint)
-        security_router = init_security_router(self.signer, StaticBearerTokenVerifier(self.master_token))
-
-        verifier = JWTVerifier(self.signer)
+        security_router = init_security_router(self.signer, StaticBearerAuthenticator(self.master_token))
 
         # mount the api routes on the app object
-        app.include_router(bundles_router, tags=["Bundle Server"], dependencies=[Depends(verifier)])
-        app.include_router(data_updates_router, tags=["Data Updates"], dependencies=[Depends(verifier)])
+        app.include_router(bundles_router, tags=["Bundle Server"], dependencies=[Depends(authenticator)])
+        app.include_router(data_updates_router, tags=["Data Updates"], dependencies=[Depends(authenticator)])
         app.include_router(webhook_router, tags=["Github Webhook"])
         app.include_router(security_router, tags=["Security"])
         app.include_router(self.pubsub.router, tags=["Pub/Sub"])
@@ -190,10 +196,7 @@ class OpalServer:
         @app.on_event("shutdown")
         async def shutdown_event():
             logger.info("triggered shutdown event")
-            if self.watcher is not None:
-                self.watcher.signal_stop()
-            if self.publisher is not None:
-                asyncio.create_task(self.publisher.stop())
+            await self.stop_server_background_tasks()
 
         return app
 
@@ -226,3 +229,26 @@ class OpalServer:
                         # running the watcher, and waiting until it stops (until self.watcher.signal_stop() is called)
                         async with self.watcher:
                             await self.watcher.wait_until_should_stop()
+
+    async def stop_server_background_tasks(self):
+        logger.info("stopping background tasks...")
+
+        tasks: List[asyncio.Task] = []
+
+        if self.watcher is not None:
+            tasks.append(asyncio.create_task(self.watcher.stop()))
+        if self.publisher is not None:
+            tasks.append(asyncio.create_task(self.publisher.stop()))
+
+        try:
+            await asyncio.gather(*tasks)
+        except Exception:
+            logger.exception("exception while shutting down background tasks")
+
+    def _fix_policy_repo_clone_path(self):
+        clone_path = Path(os.path.expanduser(opal_server_config.POLICY_REPO_CLONE_PATH))
+        forbidden_paths = [Path(os.path.expanduser('~')), Path('/')]
+        if clone_path in forbidden_paths:
+            logger.warning("You cannot clone the policy repo directly to the homedir (~) or to the root directory (/)!")
+            opal_server_config.POLICY_REPO_CLONE_PATH = os.path.join(clone_path, "regoclone")
+            logger.warning(f"OPAL_POLICY_REPO_CLONE_PATH was set to: {opal_server_config.POLICY_REPO_CLONE_PATH}")

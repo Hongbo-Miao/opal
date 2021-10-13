@@ -2,8 +2,11 @@ import asyncio
 import hashlib
 import itertools
 import json
-from typing import List, Tuple
+from opal_client.callbacks.reporter import CallbacksReporter
+from opal_client.callbacks.register import CallbackConfig, CallbacksRegister
+from typing import List, Optional, Tuple
 import uuid
+import aiohttp
 
 from aiohttp.client import ClientSession, ClientError
 from fastapi_websocket_pubsub import PubSubClient
@@ -23,6 +26,8 @@ from opal_common.schemas.data import (DataEntryReport, DataSourceConfig,
                                       DataSourceEntry, DataUpdate,
                                       DataUpdateReport)
 from opal_common.utils import get_authorization_header
+from opal_common.http import is_http_error_response
+from opal_common.security.sslcontext import get_custom_ssl_context
 
 
 class DataUpdater:
@@ -32,7 +37,10 @@ class DataUpdater:
                  fetch_on_connect: bool = True,
                  data_topics: List[str] = None,
                  policy_store: BasePolicyStoreClient = None,
-                 should_send_reports=None):
+                 should_send_reports=None,
+                 data_fetcher: Optional[DataFetcher] = None,
+                 callbacks_register: Optional[CallbacksRegister] = None
+        ):
         """
         Keeps policy-stores (e.g. OPA) up to date with relevant data
         Obtains data configuration on startup from OPAL-server
@@ -62,7 +70,9 @@ class DataUpdater:
         # The task running the Pub/Sub subcribing client
         self._subscriber_task = None
         # Data fetcher
-        self._data_fetcher = DataFetcher()
+        self._data_fetcher = data_fetcher or DataFetcher()
+        self._callbacks_register = callbacks_register or CallbacksRegister()
+        self._callbacks_reporter = CallbacksReporter(self._callbacks_register, self._data_fetcher)
         self._token = token
         self._server_url = pubsub_url
         self._data_sources_config_url = data_sources_config_url
@@ -71,6 +81,8 @@ class DataUpdater:
         else:
             self._extra_headers = [get_authorization_header(self._token)]
         self._stopping = False
+        self._custom_ssl_context = get_custom_ssl_context()
+        self._ssl_context_kwargs = {'ssl': self._custom_ssl_context} if self._custom_ssl_context is not None else {}
 
     async def __aenter__(self):
         await self.start()
@@ -118,7 +130,7 @@ class DataUpdater:
         logger.info("Getting data-sources configuration from '{source}'", source=url)
         try:
             async with ClientSession(headers=self._extra_headers) as session:
-                response = await session.get(url)
+                response = await session.get(url, **self._ssl_context_kwargs)
                 if response.status == 200:
                     return DataSourceConfig.parse_obj(await response.json())
                 else:
@@ -217,40 +229,16 @@ class DataUpdater:
         """
         Calculate an hash (sah256) on the given data, if data isn't a string, it will be converted to JSON.
         String are encoded as 'utf-8' prior to hash calculation.
-        Returns: 
-            the hash of the given data (as a a hexdigit string) or '' on failure to process. 
+        Returns:
+            the hash of the given data (as a a hexdigit string) or '' on failure to process.
         """
         try:
             if not isinstance(data, str):
-                data = json.dumps(data)
+                data = json.dumps(data, default=str)
             return hashlib.sha256(data.encode('utf-8')).hexdigest()
         except:
             logger.exception("Failed to calculate hash for data {data}", data=data)
             return ""
-
-    async def report_update_results(self, update: DataUpdate, reports: List[DataEntryReport], data_fetcher: DataFetcher):
-        try:
-            whole_report = DataUpdateReport(update_id=update.id, reports=reports)
-
-            callbacks = update.callback.callbacks or opal_client_config.DEFAULT_UPDATE_CALLBACKS.callbacks
-            urls = []
-            for callback in callbacks:
-                if isinstance(callback, str):
-                    url = callback
-                    callback_config = opal_client_config.DEFAULT_UPDATE_CALLBACK_CONFIG.copy()
-                else:
-                    url, callback_config = callback
-                callback_config.data = whole_report.json()
-                urls.append((url, callback_config))
-
-            logger.info("Reporting the update to requested callbacks", urls=repr(urls))
-            report_results = await data_fetcher.handle_urls(urls)
-            # log reports which we failed to send
-            for (url, config), result in zip(urls,report_results):
-                if isinstance(result, Exception):
-                    logger.error("Failed to send report to {url} with config {config}", url=url, config=config, exc_info=result)
-        except:
-            logger.exception("Failed to excute report_update_results")
 
     async def update_policy_data(self, update: DataUpdate = None, policy_store: BasePolicyStoreClient = None, data_fetcher=None):
         """
@@ -274,12 +262,31 @@ class DataUpdater:
         # Urls may be None - handle_urls has a default for None
         policy_data_with_urls = await data_fetcher.handle_urls(urls)
         # Save the data from the update
-        # We wrap our interaction with the policy store with a transaction  
+        # We wrap our interaction with the policy store with a transaction
         async with policy_store.transaction_context(update.id) as store_transaction:
             # for intelisense treat store_transaction as a PolicyStoreClient (which it proxies)
             store_transaction: BasePolicyStoreClient
             for (url, fetch_config, result), entry in itertools.zip_longest(policy_data_with_urls, entries):
-                if not isinstance(result, Exception):
+                fetched_error_response = False
+
+                if isinstance(result, Exception):
+                    fetched_error_response = True
+                    logger.error("Failed to fetch url {url}, got exception: {exc}", url=url, exc=result)
+
+                if isinstance(result, aiohttp.ClientResponse) and is_http_error_response(result): # error responses
+                    fetched_error_response = True
+                    try:
+                        error_content = await result.json()
+                    except json.JSONDecodeError:
+                        error_content = await result.text()
+                    logger.error(
+                        "Failed to fetch url {url}, got response code {status} with error: {error}",
+                        url=url,
+                        status=result.status,
+                        error=error_content
+                    )
+
+                if not fetched_error_response:
                     # get path to store the URL data (default mode (None) is as "" - i.e. as all the data at root)
                     policy_store_path = "" if entry is None else entry.dst_path
                     # None is not valid - use "" (protect from missconfig)
@@ -317,4 +324,6 @@ class DataUpdater:
         # should we send a report to defined callbackers?
         if self._should_send_reports:
             # spin off reporting (no need to wait on it)
-            asyncio.create_task(self.report_update_results(update, reports, data_fetcher))
+            whole_report = DataUpdateReport(update_id=update.id, reports=reports)
+            extra_callbacks = self._callbacks_register.normalize_callbacks(update.callback.callbacks)
+            asyncio.create_task(self._callbacks_reporter.report_update_results(whole_report, extra_callbacks))
